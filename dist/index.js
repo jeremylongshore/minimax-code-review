@@ -31841,6 +31841,11 @@ const MINIMAX_API_URL = 'https://api.minimaxi.chat/v1/chat/completions';
 const COMMENT_MARKER = '<!-- minimax-code-review -->';
 const MAX_RESPONSE_SIZE = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 300_000;
+const DEFAULT_MODEL = 'MiniMax-M2.5';
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31906,33 +31911,50 @@ function buildPrompt(files, maxDiffChars) {
 }
 
 async function reviewWithMiniMax(apiKey, model, systemPrompt, diff) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const requestBody = JSON.stringify({
+    model,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Please review this pull request:\n\n${diff}` },
+    ],
+  });
 
   let response;
-  try {
-    response = await fetch(MINIMAX_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Please review this pull request:\n\n${diff}` },
-        ],
-      }),
-      signal: controller.signal,
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      throw new Error('MiniMax API request timed out.');
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      response = await fetch(MINIMAX_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+        },
+        body: requestBody,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      const failure =
+        err.name === 'AbortError'
+          ? new Error('MiniMax API request timed out.')
+          : err;
+      // Retry transient network/timeout errors with exponential backoff.
+      if (attempt < MAX_RETRIES) {
+        await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
+        continue;
+      }
+      throw failure;
+    } finally {
+      clearTimeout(timeout);
     }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
+
+    // Retry transient server-side failures (429 rate limit, 5xx) only.
+    if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
+      await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
+      continue;
+    }
+    break;
   }
 
   if (!response.ok) {
@@ -31962,7 +31984,10 @@ async function reviewWithMiniMax(apiKey, model, systemPrompt, diff) {
 async function run() {
   const apiKey = core.getInput('MINIMAX_API_KEY', { required: true });
   core.setSecret(apiKey);
-  const model = core.getInput('MINIMAX_MODEL');
+  // Fall back to the default when MINIMAX_MODEL is passed but empty (e.g. an
+  // unset `${{ vars.MINIMAX_MODEL }}`), which otherwise bypasses the action.yml
+  // default and sends model:"" — a hard API error.
+  const model = core.getInput('MINIMAX_MODEL') || DEFAULT_MODEL;
   const systemPrompt = core.getInput('MINIMAX_SYSTEM_PROMPT');
   const reviewerName = core.getInput('MINIMAX_REVIEWER_NAME');
   const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
