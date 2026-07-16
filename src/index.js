@@ -169,7 +169,29 @@ async function reviewWithMiniMax(apiKey, model, systemPrompt, diff, prContext) {
   if (!content) {
     throw new Error('MiniMax API returned an empty response.');
   }
-  return content;
+  return stripThinking(content);
+}
+
+// Reasoning models (e.g. MiniMax-M3) may emit <think>…</think> blocks before
+// the review. Never post chain-of-thought into a PR comment: strip closed
+// blocks, and when the model left the tag unclosed drop the dangling block
+// too. If nothing remains (e.g. the response was truncated mid-reasoning),
+// post an explicit notice instead of leaking the raw reasoning or posting an
+// empty comment.
+function stripThinking(content) {
+  let stripped = content.replace(/<think>[\s\S]*?<\/think>/g, '');
+  if (/<think>/.test(stripped)) {
+    stripped = stripped.split('</think>').pop().replace(/<think>[\s\S]*$/, '');
+  }
+  stripped = stripped.trim();
+  if (stripped.length > 0) {
+    return stripped;
+  }
+  const plain = content.trim();
+  if (plain.length > 0 && !/<think>/.test(plain)) {
+    return plain;
+  }
+  return '_The model returned only reasoning with no review text (likely a truncated response). Re-run the review job._';
 }
 
 async function run() {
