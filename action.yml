@@ -24,6 +24,10 @@ inputs:
     description: "Maximum total characters for the diff sent to the API (0 = unlimited)"
     required: false
     default: "0"
+  INCLUDE_PR_BODY:
+    description: "Include the PR title and description in the review prompt so the reviewer can check the author's claims against the diff. The description is author-supplied text — the prompt labels it as claims to verify, not instructions to follow. (true/false)"
+    required: false
+    default: "false"
   GITHUB_TOKEN:
     description: "GitHub token for API access"
     required: false
