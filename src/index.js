@@ -241,7 +241,18 @@ async function run() {
   }
 
   const diff = buildPrompt(filteredFiles, maxDiffChars);
-  const prContext = includePrBody ? buildPrContext(context.payload.pull_request) : '';
+  // Fetch the PR fresh instead of trusting the event-payload snapshot: body
+  // edits do not fire `synchronize`, and re-runs replay the original payload,
+  // so the snapshot can describe a stale title/description.
+  let prContext = '';
+  if (includePrBody) {
+    const { data: freshPr } = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number,
+    });
+    prContext = buildPrContext(freshPr);
+  }
   const review = await reviewWithMiniMax(apiKey, model, systemPrompt, diff, prContext);
   const commentMarker = commentMarkerFor(reviewerName);
   const body = `## ${reviewerName}\n\n${review}\n\n${commentMarker}`;
