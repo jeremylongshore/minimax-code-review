@@ -29922,6 +29922,248 @@ function wrappy (fn, cb) {
 
 /***/ }),
 
+/***/ 8125:
+/***/ ((module) => {
+
+"use strict";
+
+
+const TOTAL_MS = 300_000;
+const MAX_ATTEMPTS = 3;
+const MAX_CHARS = 1024 * 1024;
+const MESSAGES = {
+  DEADLINE: 'Review provider exceeded its total request deadline.',
+  TRANSPORT: 'Review provider transport failed.',
+  HTTP: 'Review provider returned an unsuccessful HTTP status.',
+  STATUS: 'Review provider returned an invalid HTTP status.',
+  RESPONSE: 'Review provider returned an invalid response stream.',
+  SIZE: 'Review provider response exceeded the character limit.',
+  JSON: 'Review provider returned invalid JSON.',
+};
+class RequestFailure extends Error {
+  constructor(kind) {
+    super(MESSAGES[kind]);
+    this.name = 'ReviewRequestError';
+    this.code = 'REVIEW_' + kind;
+    this.kind = kind;
+  }
+}
+
+/** JSON transport only. Caller retains endpoint/model/request and content policy. */
+async function requestReviewJson({
+  url,
+  apiKey,
+  requestBody,
+  onEvent = () => {},
+  fetchImpl = globalThis.fetch,
+  now = () => performance.now(),
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+}) {
+  const began = now();
+  let controller;
+  let reader;
+  let response;
+  let expired = false;
+  let attempt = 0;
+  let rejectPending;
+  const cancel = (body) => {
+    try {
+      Promise.resolve(body?.cancel()).catch(() => {});
+    } catch {
+      /* Best effort, never block budget. */
+    }
+  };
+  const cancelCurrent = () => {
+    try {
+      cancel(reader || response?.body);
+    } catch {
+      /* Untrusted response getters must not replace diagnostics. */
+    }
+  };
+  const abort = () => {
+    try {
+      controller?.abort();
+    } catch {
+      /* Fixed diagnostics only. */
+    }
+  };
+  const emit = (phase, status, failureClass) => {
+    const event = { phase, attempt, elapsedMs: Math.max(0, Math.round(now() - began)) };
+    if (Number.isInteger(status) && status >= 100 && status <= 599) event.status = status;
+    if (failureClass) event.failureClass = failureClass;
+    try {
+      Promise.resolve(onEvent(event)).catch(() => {});
+    } catch {
+      /* An observer cannot change transport semantics. */
+    }
+  };
+  const check = () => {
+    if (expired || now() - began >= TOTAL_MS) {
+      expired = true;
+      throw new RequestFailure('DEADLINE');
+    }
+  };
+  const wait = async (operation) => {
+    check();
+    let registered;
+    try {
+      const value = await new Promise((resolve, reject) => {
+        registered = reject;
+        rejectPending = reject;
+        // Handle late resolution/rejection even after the deadline wins.
+        Promise.resolve()
+          .then(() => {
+            check();
+            return operation();
+          })
+          .then(resolve, reject);
+      });
+      check();
+      return value;
+    } finally {
+      if (rejectPending === registered) rejectPending = undefined;
+    }
+  };
+  const timer = setTimeoutImpl(
+    () => {
+      expired = true;
+      // Reject explicitly even if fetch/read ignores AbortSignal.
+      rejectPending?.(new RequestFailure('DEADLINE'));
+      abort();
+      cancelCurrent();
+    },
+    Math.max(0, TOTAL_MS - (now() - began)),
+  );
+  async function readJson() {
+    const decoder = new TextDecoder();
+    let text = '';
+    if (!response.body || typeof response.body.getReader !== 'function')
+      throw new RequestFailure('RESPONSE');
+    reader = response.body.getReader();
+    if (!reader || typeof reader.read !== 'function') throw new RequestFailure('RESPONSE');
+    for (;;) {
+      const chunk = await wait(() => reader.read());
+      if (!chunk || typeof chunk.done !== 'boolean') throw new RequestFailure('RESPONSE');
+      if (chunk.done) break;
+      if (!(chunk.value instanceof Uint8Array)) throw new RequestFailure('RESPONSE');
+      // Bound decoder allocations even when a fetch implementation supplies a huge chunk.
+      for (let offset = 0; offset < chunk.value.byteLength; offset += 65_536) {
+        check();
+        text += decoder.decode(chunk.value.subarray(offset, offset + 65_536), { stream: true });
+        if (text.length > MAX_CHARS) throw new RequestFailure('SIZE');
+      }
+    }
+    text += decoder.decode();
+    if (text.length > MAX_CHARS) throw new RequestFailure('SIZE');
+    check();
+    let value;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      throw new RequestFailure('JSON');
+    }
+    check();
+    return value;
+  }
+  try {
+    for (attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      check();
+      controller = new AbortController();
+      response = undefined;
+      reader = undefined;
+      emit('request');
+      try {
+        check();
+        const operation = Promise.resolve().then(() => {
+          check();
+          return fetchImpl(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: requestBody,
+            signal: controller.signal,
+          });
+        });
+        // An abort-ignoring late fetch may still produce an unread body.
+        operation
+          .then(
+            (late) => {
+              if (expired) {
+                try {
+                  cancel(late?.body);
+                } catch {
+                  /* Late response is untrusted. */
+                }
+              }
+            },
+            () => {},
+          )
+          .catch(() => {});
+        response = await wait(() => operation);
+        const status = response?.status;
+        if (!Number.isInteger(status) || status < 100 || status > 599)
+          throw new RequestFailure('STATUS');
+        emit('headers', status);
+        if (status < 200 || status >= 300) {
+          cancelCurrent();
+          if ((status === 429 || status >= 500) && attempt < MAX_ATTEMPTS) {
+            abort();
+            emit('backoff', status);
+          } else throw new RequestFailure('HTTP');
+        } else {
+          emit('body', status);
+          const json = await readJson();
+          emit('complete', status);
+          return json;
+        }
+      } catch (error) {
+        cancelCurrent();
+        abort();
+        const failure = error instanceof RequestFailure ? error : new RequestFailure('TRANSPORT');
+        emit('failure', undefined, failure.kind.toLowerCase());
+        if (failure.kind !== 'TRANSPORT' || attempt >= MAX_ATTEMPTS) throw failure;
+        emit('backoff');
+      } finally {
+        try {
+          reader?.releaseLock();
+        } catch {
+          /* Pending reads may still hold the lock. */
+        }
+      }
+      let backoffTimer;
+      try {
+        await wait(
+          () =>
+            new Promise((resolve) => {
+              backoffTimer = setTimeoutImpl(resolve, 1000 * 2 ** (attempt - 1));
+            }),
+        );
+      } finally {
+        clearTimeoutImpl(backoffTimer);
+      }
+    }
+    throw new RequestFailure('TRANSPORT');
+  } catch (error) {
+    const failure = error instanceof RequestFailure ? error : new RequestFailure('TRANSPORT');
+    if (failure.kind === 'DEADLINE') emit('failure', undefined, 'deadline');
+    throw failure;
+  } finally {
+    clearTimeoutImpl(timer);
+    abort();
+    // Successful readers are released; canceling a completed stream is harmless.
+    cancelCurrent();
+    try {
+      reader?.releaseLock();
+    } catch {
+      /* Never mask the fixed terminal diagnostic. */
+    }
+  }
+}
+module.exports = { requestReviewJson };
+
+
+/***/ }),
+
 /***/ 2613:
 /***/ ((module) => {
 
@@ -31836,19 +32078,16 @@ module.exports = parseParams
 var __webpack_exports__ = {};
 const core = __nccwpck_require__(7484);
 const github = __nccwpck_require__(3228);
+const { requestReviewJson } = __nccwpck_require__(8125);
 
 // International OpenAI-compatible base (api.minimaxi.chat is the separate
 // consumer chat surface; the MiniMax-M* models are served from api.minimax.io/v1).
 // Overridable via the MINIMAX_BASE_URL input for other OpenAI-compatible gateways.
 const DEFAULT_BASE_URL = 'https://api.minimax.io/v1';
 const MARKER_PREFIX = 'minimax-code-review';
-const MAX_RESPONSE_SIZE = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 300_000;
 const DEFAULT_MODEL = 'MiniMax-M3';
 const DEFAULT_REVIEWER_NAME = 'MiniMax Code Review';
 const MAX_PR_BODY_CHARS = 8000;
-const MAX_RETRIES = 3;
-const RETRY_BASE_MS = 1000;
 
 // One sticky comment per reviewer identity: the default reviewer name keeps
 // the historical bare marker (backward compatible with comments posted by
@@ -31865,8 +32104,6 @@ function commentMarkerFor(reviewerName) {
     .replace(/^-+|-+$/g, '');
   return `<!-- ${MARKER_PREFIX}:${slug || 'custom'} -->`;
 }
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function matchesPattern(filename, pattern) {
   const escaped = pattern
@@ -31950,64 +32187,18 @@ async function reviewWithMiniMax(apiKey, baseUrl, model, systemPrompt, diff, prC
     ],
   });
 
-  let response;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const data = await requestReviewJson({
+    url: apiUrl,
+    apiKey,
+    requestBody,
+    onEvent: (event) => core.info(JSON.stringify({ component: 'provider', ...event })),
+  });
 
-    try {
-      response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: requestBody,
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const failure =
-        err.name === 'AbortError'
-          ? new Error('MiniMax API request timed out.')
-          : err;
-      // Retry transient network/timeout errors with exponential backoff.
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
-        continue;
-      }
-      throw failure;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    // Retry transient server-side failures (429 rate limit, 5xx) only.
-    if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-      await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
-      continue;
-    }
-    break;
-  }
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`MiniMax API error ${response.status}: ${error.slice(0, 200)}`);
-  }
-
-  const text = await response.text();
-  if (text.length > MAX_RESPONSE_SIZE) {
-    throw new Error('MiniMax API response exceeded size limit.');
-  }
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error('MiniMax API returned invalid JSON.');
-  }
-
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('MiniMax API returned an empty response.');
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content) {
+    const error = new Error('Review provider returned no review text.');
+    error.code = 'REVIEW_CONTENT';
+    throw error;
   }
   return stripThinking(content);
 }
@@ -32034,7 +32225,18 @@ function stripThinking(content) {
   return '_The model returned only reasoning with no review text (likely a truncated response). Re-run the review job._';
 }
 
+const actionBegan = performance.now();
+function phase(name, stage, status) {
+  const event = {
+    component: 'action', phase: name, stage,
+    elapsedMs: Math.max(0, Math.round(performance.now() - actionBegan)),
+  };
+  if (Number.isInteger(status) && status >= 100 && status <= 599) event.status = status;
+  core.info(JSON.stringify(event));
+}
+
 async function run() {
+  phase('configuration', 'start');
   const apiKey = core.getInput('MINIMAX_API_KEY', { required: true });
   core.setSecret(apiKey);
   // Fall back to the default when MINIMAX_MODEL is passed but empty (e.g. an
@@ -32054,6 +32256,7 @@ async function run() {
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
+  phase('configuration', 'complete');
 
   const octokit = github.getOctokit(token);
   const { context } = github;
@@ -32068,7 +32271,9 @@ async function run() {
 
   core.info(`Reviewing PR #${pull_number} with model ${model}...`);
 
+  phase('github_files', 'start');
   const files = await getChangedFiles(octokit, owner, repo, pull_number);
+  phase('github_files', 'complete');
   const filteredFiles = filterFiles(files, excludePatterns);
 
   if (excludePatterns.length > 0) {
@@ -32089,25 +32294,32 @@ async function run() {
   // so the snapshot can describe a stale title/description.
   let prContext = '';
   if (includePrBody) {
+    phase('github_context', 'start');
     const { data: freshPr } = await octokit.rest.pulls.get({
       owner,
       repo,
       pull_number,
     });
     prContext = buildPrContext(freshPr);
+    phase('github_context', 'complete');
   }
+  phase('provider', 'start');
   const review = await reviewWithMiniMax(apiKey, baseUrl, model, systemPrompt, diff, prContext);
+  phase('provider', 'complete');
   const commentMarker = commentMarkerFor(reviewerName);
   const body = `## ${reviewerName}\n\n${review}\n\n${commentMarker}`;
 
+  phase('github_comments', 'start');
   const { data: comments } = await octokit.rest.issues.listComments({
     owner,
     repo,
     issue_number: pull_number,
   });
 
+  phase('github_comments', 'complete');
   const existing = comments.find(c => c.body?.includes(commentMarker));
 
+  phase('github_post', 'start');
   if (existing) {
     await octokit.rest.issues.updateComment({
       owner,
@@ -32124,10 +32336,19 @@ async function run() {
     });
   }
 
+  phase('github_post', 'complete');
   core.info('Code review posted successfully.');
 }
 
-run().catch(err => core.setFailed(err.message));
+run().catch((error) => {
+  const known = new Set([
+    'REVIEW_DEADLINE', 'REVIEW_TRANSPORT', 'REVIEW_HTTP', 'REVIEW_STATUS',
+    'REVIEW_RESPONSE', 'REVIEW_SIZE', 'REVIEW_JSON', 'REVIEW_CONTENT',
+  ]);
+  const failureClass = known.has(error?.code) ? error.code : 'ACTION_OPERATION';
+  phase('failure', failureClass, error?.status);
+  core.setFailed(`Review action failed (${failureClass}); see phase diagnostics.`);
+});
 
 module.exports = __webpack_exports__;
 /******/ })()
