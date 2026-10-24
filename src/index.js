@@ -1,15 +1,12 @@
 const core = require('@actions/core');
 const github = require('@actions/github');
+const { requestReviewJson } = require('./review-request');
 
 const MINIMAX_API_URL = 'https://api.minimaxi.chat/v1/chat/completions';
 const MARKER_PREFIX = 'minimax-code-review';
-const MAX_RESPONSE_SIZE = 1024 * 1024;
-const REQUEST_TIMEOUT_MS = 300_000;
 const DEFAULT_MODEL = 'MiniMax-M2.5';
 const DEFAULT_REVIEWER_NAME = 'MiniMax Code Review';
 const MAX_PR_BODY_CHARS = 8000;
-const MAX_RETRIES = 3;
-const RETRY_BASE_MS = 1000;
 
 // One sticky comment per reviewer identity: the default reviewer name keeps
 // the historical bare marker (backward compatible with comments posted by
@@ -27,8 +24,6 @@ function commentMarkerFor(reviewerName) {
   return `<!-- ${MARKER_PREFIX}:${slug || 'custom'} -->`;
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
 function matchesPattern(filename, pattern) {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
@@ -44,7 +39,7 @@ function filterFiles(files, excludePatterns) {
   if (!excludePatterns || excludePatterns.length === 0) {
     return files;
   }
-  return files.filter(f => !excludePatterns.some(p => matchesPattern(f.filename, p)));
+  return files.filter((f) => !excludePatterns.some((p) => matchesPattern(f.filename, p)));
 }
 
 async function getChangedFiles(octokit, owner, repo, pullNumber) {
@@ -68,7 +63,7 @@ async function getChangedFiles(octokit, owner, repo, pullNumber) {
 }
 
 function buildPrompt(files, maxDiffChars) {
-  const patchableFiles = files.filter(f => f.patch);
+  const patchableFiles = files.filter((f) => f.patch);
   const includedDiffs = [];
   const skippedFiles = [];
   let totalChars = 0;
@@ -86,7 +81,7 @@ function buildPrompt(files, maxDiffChars) {
   let diffs = includedDiffs.join('\n\n');
 
   if (skippedFiles.length > 0) {
-    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map(f => `> - ${f}`).join('\n')}`;
+    diffs += `\n\n> **Note:** The following files were excluded because the diff exceeded the \`MAX_DIFF_CHARS\` limit:\n${skippedFiles.map((f) => `> - ${f}`).join('\n')}`;
   }
 
   return diffs;
@@ -110,64 +105,18 @@ async function reviewWithMiniMax(apiKey, model, systemPrompt, diff, prContext) {
     ],
   });
 
-  let response;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const data = await requestReviewJson({
+    url: MINIMAX_API_URL,
+    apiKey,
+    requestBody,
+    onEvent: (event) => core.info(JSON.stringify({ component: 'provider', ...event })),
+  });
 
-    try {
-      response = await fetch(MINIMAX_API_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        body: requestBody,
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const failure =
-        err.name === 'AbortError'
-          ? new Error('MiniMax API request timed out.')
-          : err;
-      // Retry transient network/timeout errors with exponential backoff.
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
-        continue;
-      }
-      throw failure;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    // Retry transient server-side failures (429 rate limit, 5xx) only.
-    if ((response.status === 429 || response.status >= 500) && attempt < MAX_RETRIES) {
-      await sleep(RETRY_BASE_MS * 2 ** (attempt - 1));
-      continue;
-    }
-    break;
-  }
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`MiniMax API error ${response.status}: ${error.slice(0, 200)}`);
-  }
-
-  const text = await response.text();
-  if (text.length > MAX_RESPONSE_SIZE) {
-    throw new Error('MiniMax API response exceeded size limit.');
-  }
-
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error('MiniMax API returned invalid JSON.');
-  }
-
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('MiniMax API returned an empty response.');
+  const content = data?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content) {
+    const error = new Error('Review provider returned no review text.');
+    error.code = 'REVIEW_CONTENT';
+    throw error;
   }
   return stripThinking(content);
 }
@@ -181,7 +130,10 @@ async function reviewWithMiniMax(apiKey, model, systemPrompt, diff, prContext) {
 function stripThinking(content) {
   let stripped = content.replace(/<think>[\s\S]*?<\/think>/g, '');
   if (/<think>/.test(stripped)) {
-    stripped = stripped.split('</think>').pop().replace(/<think>[\s\S]*$/, '');
+    stripped = stripped
+      .split('</think>')
+      .pop()
+      .replace(/<think>[\s\S]*$/, '');
   }
   stripped = stripped.trim();
   if (stripped.length > 0) {
@@ -194,7 +146,20 @@ function stripThinking(content) {
   return '_The model returned only reasoning with no review text (likely a truncated response). Re-run the review job._';
 }
 
+const actionBegan = performance.now();
+function phase(name, stage, status) {
+  const event = {
+    component: 'action',
+    phase: name,
+    stage,
+    elapsedMs: Math.max(0, Math.round(performance.now() - actionBegan)),
+  };
+  if (Number.isInteger(status) && status >= 100 && status <= 599) event.status = status;
+  core.info(JSON.stringify(event));
+}
+
 async function run() {
+  phase('configuration', 'start');
   const apiKey = core.getInput('MINIMAX_API_KEY', { required: true });
   core.setSecret(apiKey);
   // Fall back to the default when MINIMAX_MODEL is passed but empty (e.g. an
@@ -204,13 +169,15 @@ async function run() {
   const systemPrompt = core.getInput('MINIMAX_SYSTEM_PROMPT');
   const reviewerName = core.getInput('MINIMAX_REVIEWER_NAME') || DEFAULT_REVIEWER_NAME;
   const includePrBody = core.getInput('INCLUDE_PR_BODY').toLowerCase() === 'true';
-  const excludePatterns = core.getInput('EXCLUDE_PATTERNS')
+  const excludePatterns = core
+    .getInput('EXCLUDE_PATTERNS')
     .split(',')
-    .map(p => p.trim())
-    .filter(p => p.length > 0);
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
   const maxDiffChars = parseInt(core.getInput('MAX_DIFF_CHARS'), 10) || 0;
   const token = core.getInput('GITHUB_TOKEN');
   core.setSecret(token);
+  phase('configuration', 'complete');
 
   const octokit = github.getOctokit(token);
   const { context } = github;
@@ -225,7 +192,9 @@ async function run() {
 
   core.info(`Reviewing PR #${pull_number} with model ${model}...`);
 
+  phase('github_files', 'start');
   const files = await getChangedFiles(octokit, owner, repo, pull_number);
+  phase('github_files', 'complete');
   const filteredFiles = filterFiles(files, excludePatterns);
 
   if (excludePatterns.length > 0) {
@@ -235,7 +204,7 @@ async function run() {
     }
   }
 
-  if (!filteredFiles.some(f => f.patch)) {
+  if (!filteredFiles.some((f) => f.patch)) {
     core.info('No diff found — skipping review.');
     return;
   }
@@ -246,25 +215,32 @@ async function run() {
   // so the snapshot can describe a stale title/description.
   let prContext = '';
   if (includePrBody) {
+    phase('github_context', 'start');
     const { data: freshPr } = await octokit.rest.pulls.get({
       owner,
       repo,
       pull_number,
     });
     prContext = buildPrContext(freshPr);
+    phase('github_context', 'complete');
   }
+  phase('provider', 'start');
   const review = await reviewWithMiniMax(apiKey, model, systemPrompt, diff, prContext);
+  phase('provider', 'complete');
   const commentMarker = commentMarkerFor(reviewerName);
   const body = `## ${reviewerName}\n\n${review}\n\n${commentMarker}`;
 
+  phase('github_comments', 'start');
   const { data: comments } = await octokit.rest.issues.listComments({
     owner,
     repo,
     issue_number: pull_number,
   });
 
-  const existing = comments.find(c => c.body?.includes(commentMarker));
+  phase('github_comments', 'complete');
+  const existing = comments.find((c) => c.body?.includes(commentMarker));
 
+  phase('github_post', 'start');
   if (existing) {
     await octokit.rest.issues.updateComment({
       owner,
@@ -281,7 +257,22 @@ async function run() {
     });
   }
 
+  phase('github_post', 'complete');
   core.info('Code review posted successfully.');
 }
 
-run().catch(err => core.setFailed(err.message));
+run().catch((error) => {
+  const known = new Set([
+    'REVIEW_DEADLINE',
+    'REVIEW_TRANSPORT',
+    'REVIEW_HTTP',
+    'REVIEW_STATUS',
+    'REVIEW_RESPONSE',
+    'REVIEW_SIZE',
+    'REVIEW_JSON',
+    'REVIEW_CONTENT',
+  ]);
+  const failureClass = known.has(error?.code) ? error.code : 'ACTION_OPERATION';
+  phase('failure', failureClass, error?.status);
+  core.setFailed(`Review action failed (${failureClass}); see phase diagnostics.`);
+});

@@ -98,6 +98,30 @@ Instead of using default values for `MINIMAX_MODEL`, `MINIMAX_SYSTEM_PROMPT`, an
           MINIMAX_REVIEWER_NAME: ${{ vars.MINIMAX_REVIEWER_NAME }}
 ```
 
+## Request deadline and diagnostics
+
+Each provider review has one 300-second deadline covering connection, response
+headers, streamed response text, and retry backoff. Up to three attempts share
+that budget. Transient transport errors, HTTP 429, and HTTP 5xx can retry; a
+stalled response body cannot continue indefinitely after headers arrive.
+The existing response limit is 1,048,576 JavaScript string characters, checked
+while decoding the stream. Synchronous JavaScript work cannot be preempted by
+the timer; elapsed time is checked around parsing.
+
+Structured log events identify configuration, GitHub file/context retrieval,
+provider request/headers/body/backoff, and comment retrieval/publication. They
+contain phase names, elapsed milliseconds, attempt numbers, numeric HTTP status
+when available, and fixed failure classes. Provider error bodies, credentials,
+prompts, diffs, URLs, and raw exception messages are excluded from these events.
+The final failure identifies the class; the preceding phase identifies where
+execution stopped. These diagnostics do not establish the cause of historical
+job timeouts that lacked phase logs.
+
+GitHub API operations retain the runner's job timeout. This change neither
+increases that timeout nor changes the selected model, endpoint, review prompt,
+diff coverage, or reviewer identity. Consumers must explicitly adopt a reviewed
+commit before their action behavior changes.
+
 ## Contributing
 
 Contributions are welcome. See the [CONTRIBUTING](CONTRIBUTING.md) file for more information.
