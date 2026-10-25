@@ -18,7 +18,7 @@ The action runs from `dist/index.js`, which is a self-contained bundle built fro
 
 ## Development setup
 
-**Prerequisites:** Node.js 20+
+**Prerequisites:** Node.js 24+
 
 ```bash
 git clone https://github.com/tarmojussila/minimax-code-review.git
@@ -28,9 +28,10 @@ npm install
 
 ## Making changes
 
-Edit `src/index.js`, then rebuild the bundle:
+Run the isolated regression tests, then rebuild the bundle after editing `src/`:
 
 ```bash
+npm test
 npm run build
 ```
 
