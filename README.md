@@ -102,8 +102,13 @@ Instead of using default values for `MINIMAX_MODEL`, `MINIMAX_SYSTEM_PROMPT`, an
 
 Each provider review has one 300-second deadline covering connection, response
 headers, streamed response text, and retry backoff. Up to three attempts share
-that budget. Transient transport errors, HTTP 429, and HTTP 5xx can retry; a
+that budget, including 1-second and 2-second backoffs. Earlier versions allowed
+three separate 300-second windows and did not bound stalled response bodies.
+The total waiting allowance is now shorter. Transient transport errors, HTTP 429,
+and HTTP 5xx can retry; a
 stalled response body cannot continue indefinitely after headers arrive.
+The action requires the Node24 built-in fetch/WHATWG response stream; a patched
+fetch without getReader() is refused instead of buffering an unbounded body.
 The existing response limit is 1,048,576 JavaScript string characters, checked
 while decoding the stream. Synchronous JavaScript work cannot be preempted by
 the timer; elapsed time is checked around parsing.
@@ -117,7 +122,9 @@ A request event marks attempt preparation; a later deadline check can prevent
 dispatch. A single deadline failure identifies the class; the preceding phase
 identifies where execution stopped. Terminal HTTP failures retain numeric status.
 These diagnostics do not establish the cause of historical job timeouts that
-lacked phase logs.
+lacked phase logs. Provider failure events can describe failed individual
+attempts followed by backoff and success; the action failure event is terminal.
+Missing required key input has a fixed ACTION_CONFIGURATION class.
 
 GitHub API operations retain the runner's job timeout. This change neither
 increases that timeout nor changes the selected model, endpoint, review prompt,

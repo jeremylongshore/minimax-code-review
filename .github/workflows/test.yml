@@ -22,4 +22,7 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm test
       - run: npm run build
-      - run: git diff --exit-code -- dist/
+      - name: Verify committed bundle outputs
+        run: |
+          git diff --exit-code -- dist/
+          test -z "$(git ls-files --others --exclude-standard -- dist/)"

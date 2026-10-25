@@ -30088,6 +30088,10 @@ async function requestReviewJson({
             body: requestBody,
             signal: controller.signal,
           });
+        }).then((received) => {
+          // Capture before wait's post-resolution deadline check can throw.
+          response = received;
+          return received;
         });
         // An abort-ignoring late fetch may still produce an unread body.
         operation
@@ -32242,7 +32246,14 @@ function phase(name, stage, status) {
 
 async function run() {
   phase('configuration', 'start');
-  const apiKey = core.getInput('MINIMAX_API_KEY', { required: true });
+  let apiKey;
+  try {
+    apiKey = core.getInput('MINIMAX_API_KEY', { required: true });
+  } catch {
+    const failure = new Error('Required review API key is not configured.');
+    failure.code = 'ACTION_CONFIGURATION';
+    throw failure;
+  }
   core.setSecret(apiKey);
   // Fall back to the default when MINIMAX_MODEL is passed but empty (e.g. an
   // unset `${{ vars.MINIMAX_MODEL }}`), which otherwise bypasses the action.yml
@@ -32347,12 +32358,16 @@ async function run() {
 
 run().catch((error) => {
   const known = new Set([
+    'ACTION_CONFIGURATION',
     'REVIEW_DEADLINE', 'REVIEW_TRANSPORT', 'REVIEW_HTTP', 'REVIEW_STATUS',
     'REVIEW_RESPONSE', 'REVIEW_SIZE', 'REVIEW_JSON', 'REVIEW_CONTENT',
   ]);
   const failureClass = known.has(error?.code) ? error.code : 'ACTION_OPERATION';
-  phase('failure', failureClass, error?.status);
-  core.setFailed(`Review action failed (${failureClass}); see phase diagnostics.`);
+  const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599
+    ? error.status : undefined;
+  phase('failure', failureClass, status);
+  const detail = status === undefined ? '' : `, HTTP ${status}`;
+  core.setFailed(`Review action failed (${failureClass}${detail}); see phase diagnostics.`);
 });
 
 module.exports = __webpack_exports__;
