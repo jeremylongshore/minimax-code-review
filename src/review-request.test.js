@@ -149,6 +149,7 @@ test('abort-ignoring headers are bounded by the one total deadline', async () =>
   await h.clock.advance(300000);
   await terminal(h);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   assert.equal(h.signals.length, 1);
   assert(h.signals[0].aborted);
   resolveLate(late);
@@ -164,6 +165,7 @@ test('fast headers and abort-ignoring body stay inside the same deadline', async
   await h.clock.advance(1);
   await terminal(h);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   assert(r.stats.canceled > 0);
   safe(h);
 });
@@ -187,6 +189,7 @@ test('backoff consumes total budget and cannot start a late second attempt', asy
   await h.clock.advance(300000);
   await terminal(h);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   assert.equal(h.signals.length, 1);
   safe(h);
 });
@@ -211,6 +214,7 @@ test('all attempts share300s rather than three independent300s windows', async (
   await h.clock.advance(300000);
   await terminal(h);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   assert.equal(count, 2);
   safe(h);
 });
@@ -337,6 +341,7 @@ test('late rejecting body after timeout is handled and cancellation errors canno
   rejectRead(new Error('private-provider-canary'));
   await h.clock.flush();
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   safe(h);
 });
 test('malformed stream is nonretryable rather than a transport retry', async () => {
@@ -370,6 +375,7 @@ test('deadline crossed before deferred fetch prevents starting a new request', a
   await terminal(h);
   assert.equal(calls, 0);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   safe(h);
 });
 test('HTTP retry aborts each old attempt even when body cancellation ignores completion', async () => {
@@ -406,5 +412,34 @@ test('deadline crossed before deferred body read prevents starting reader IO', a
   await terminal(h);
   assert.equal(r.stats.reads, 0);
   assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
   safe(h);
 });
+
+
+test('locked stream setup is a nonretryable response failure with safe diagnostics', async () => {
+  const r = response();
+  r.body.getReader = () => {
+    throw new Error('private-provider-canary private-key-canary');
+  };
+  const h = start(() => Promise.resolve(r));
+  await h.clock.advance(3000);
+  await terminal(h);
+  assert.equal(h.error().code, 'REVIEW_RESPONSE');
+  assert.equal(h.signals.length, 1);
+  assert(r.stats.canceled > 0);
+  safe(h);
+});
+for (const status of [429, 503])
+  test('terminal retry status is preserved after three HTTP attempts: ' + status, async () => {
+    const h = start(() => Promise.resolve(response('private-provider-canary', status)));
+    await h.clock.advance(3000);
+    await terminal(h);
+    assert.equal(h.error().code, 'REVIEW_HTTP');
+    assert.equal(h.error().status, status);
+    assert.equal(h.signals.length, 3);
+    const failure = h.events.filter((event) => event.phase === 'failure').at(-1);
+    assert.equal(failure.failureClass, 'http');
+    assert.equal(failure.status, status);
+    safe(h);
+  });
