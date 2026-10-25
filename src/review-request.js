@@ -160,6 +160,10 @@ async function requestReviewJson({
             body: requestBody,
             signal: controller.signal,
           });
+        }).then((received) => {
+          // Capture before wait's post-resolution deadline check can throw.
+          response = received;
+          return received;
         });
         // An abort-ignoring late fetch may still produce an unread body.
         operation

@@ -37,9 +37,11 @@ function fixture(options = {}) {
     { filename: 'src/synthetic.js', status: 'modified', patch: '+ synthetic-diff-canary' },
   ];
   const core = {
-    getInput: (name) => {
+    getInput: (name, options) => {
       inputReads.push(name);
-      return inputs[name] || '';
+      const value = inputs[name] || '';
+      if (options?.required && !value) throw new Error(SECRET);
+      return value;
     },
     setSecret: (value) => masks.push(value),
     info: (line) => logs.push(line),
@@ -284,7 +286,7 @@ test('terminal provider401 secret body produces safe HTTP diagnostics and no ret
   assert.equal(f.requests.length, 1);
   assert.equal(f.posts.length, 0);
   assert.equal(f.failures.length, 1);
-  assert(f.failures[0].includes('REVIEW_HTTP'));
+  assert(f.failures[0].includes('REVIEW_HTTP, HTTP 401'));
   assert(events(f).some((event) =>
     event.component === 'action' && event.phase === 'failure' && event.status === 401,
   ));
@@ -375,5 +377,25 @@ test('legacy action ignores unsolicited base URL input and preserves the fixed e
   assert.equal(f.requests[0].url, 'https://api.minimaxi.chat/v1/chat/completions');
   assert.equal(JSON.parse(f.requests[0].init.body).model, 'caller-selected-model');
   assert(!f.inputReads.includes('MINIMAX_BASE_URL'));
+  safeDiagnostics(f);
+});
+
+
+test('missing required provider key has a safe configuration class without raw input errors', async () => {
+  const f = fixture({ inputs: { MINIMAX_API_KEY: '' } });
+  await f.settle();
+  assert.deepEqual(f.failures, ['Review action failed (ACTION_CONFIGURATION); see phase diagnostics.']);
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.api.length, 0);
+  safeDiagnostics(f);
+});
+test('GitHub permission failure retains only a validated HTTP status in the terminal message', async () => {
+  const error = new Error(SECRET);
+  error.status = 403;
+  const f = fixture({ githubError: error });
+  await f.settle();
+  assert.deepEqual(f.failures, ['Review action failed (ACTION_OPERATION, HTTP 403); see phase diagnostics.']);
+  assert.equal(f.requests.length, 0);
   safeDiagnostics(f);
 });

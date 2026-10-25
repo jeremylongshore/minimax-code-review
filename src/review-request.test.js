@@ -443,3 +443,18 @@ for (const status of [429, 503])
     assert.equal(failure.status, status);
     safe(h);
   });
+
+
+test('response resolving at the deadline is captured and canceled before wait can discard it', async () => {
+  const r = response();
+  const h = start(() => Promise.resolve(r).then(() => {
+    h.clock.time = 300000;
+    return r;
+  }));
+  await terminal(h);
+  assert.equal(h.error().code, 'REVIEW_DEADLINE');
+  assert(r.stats.canceled > 0, 'Resolved body must be visible to terminal cleanup');
+  assert.equal(r.stats.reads, 0);
+  assert.equal(h.events.filter((event) => event.failureClass === 'deadline').length, 1);
+  safe(h);
+});
