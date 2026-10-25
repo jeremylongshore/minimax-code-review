@@ -29941,11 +29941,12 @@ const MESSAGES = {
   JSON: 'Review provider returned invalid JSON.',
 };
 class RequestFailure extends Error {
-  constructor(kind) {
+  constructor(kind, status) {
     super(MESSAGES[kind]);
     this.name = 'ReviewRequestError';
     this.code = 'REVIEW_' + kind;
     this.kind = kind;
+    if (Number.isInteger(status) && status >= 100 && status <= 599) this.status = status;
   }
 }
 
@@ -30038,9 +30039,13 @@ async function requestReviewJson({
   async function readJson() {
     const decoder = new TextDecoder();
     let text = '';
-    if (!response.body || typeof response.body.getReader !== 'function')
+    try {
+      if (!response.body || typeof response.body.getReader !== 'function')
+        throw new RequestFailure('RESPONSE');
+      reader = response.body.getReader();
+    } catch {
       throw new RequestFailure('RESPONSE');
-    reader = response.body.getReader();
+    }
     if (!reader || typeof reader.read !== 'function') throw new RequestFailure('RESPONSE');
     for (;;) {
       const chunk = await wait(() => reader.read());
@@ -30109,7 +30114,7 @@ async function requestReviewJson({
           if ((status === 429 || status >= 500) && attempt < MAX_ATTEMPTS) {
             abort();
             emit('backoff', status);
-          } else throw new RequestFailure('HTTP');
+          } else throw new RequestFailure('HTTP', status);
         } else {
           emit('body', status);
           const json = await readJson();
@@ -30120,7 +30125,7 @@ async function requestReviewJson({
         cancelCurrent();
         abort();
         const failure = error instanceof RequestFailure ? error : new RequestFailure('TRANSPORT');
-        emit('failure', undefined, failure.kind.toLowerCase());
+        if (failure.kind !== 'DEADLINE') emit('failure', failure.status, failure.kind.toLowerCase());
         if (failure.kind !== 'TRANSPORT' || attempt >= MAX_ATTEMPTS) throw failure;
         emit('backoff');
       } finally {

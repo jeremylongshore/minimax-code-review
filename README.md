@@ -113,9 +113,11 @@ provider request/headers/body/backoff, and comment retrieval/publication. They
 contain phase names, elapsed milliseconds, attempt numbers, numeric HTTP status
 when available, and fixed failure classes. Provider error bodies, credentials,
 prompts, diffs, URLs, and raw exception messages are excluded from these events.
-The final failure identifies the class; the preceding phase identifies where
-execution stopped. These diagnostics do not establish the cause of historical
-job timeouts that lacked phase logs.
+A request event marks attempt preparation; a later deadline check can prevent
+dispatch. A single deadline failure identifies the class; the preceding phase
+identifies where execution stopped. Terminal HTTP failures retain numeric status.
+These diagnostics do not establish the cause of historical job timeouts that
+lacked phase logs.
 
 GitHub API operations retain the runner's job timeout. This change neither
 increases that timeout nor changes the selected model, endpoint, review prompt,

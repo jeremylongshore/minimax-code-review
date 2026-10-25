@@ -142,9 +142,12 @@ function fixture(options = {}) {
     },
     { codeGeneration: { strings: false, wasm: false } },
   );
-  new vm.Script(source, { filename: 'isolated-index.js' }).runInContext(context, { timeout: 1000 });
+  const completion = new vm.Script(source, { filename: 'isolated-index.js' }).runInContext(
+    context, { timeout: 1000 },
+  );
   return {
     inputReads,
+    settle: () => completion,
     logs,
     failures,
     requests,
@@ -160,7 +163,7 @@ function fixture(options = {}) {
           timers.delete(id);
           timer.fn();
         }
-      await flush();
+      await completion;
     },
   };
 }
@@ -185,7 +188,7 @@ function safeDiagnostics(f) {
 
 test('actual index preserves default endpoint/model, diff, masking, reasoning removal and sticky create', async () => {
   const f = fixture();
-  await flush();
+  await f.settle();
   assert.equal(f.failures.length, 0);
   assert.equal(f.requests.length, 1);
   assert.equal(f.posts.length, 1);
@@ -213,7 +216,7 @@ test('custom model and fresh author context preserve reviewer-specific sticky up
     },
     comments: [{ id: 42, body: '<!-- minimax-code-review:claims-reviewer -->' }],
   });
-  await flush();
+  await f.settle();
   assert.equal(f.requests[0].url, 'https://api.minimaxi.chat/v1/chat/completions');
   const body = JSON.parse(f.requests[0].init.body);
   assert.equal(body.model, 'synthetic-model');
@@ -235,7 +238,7 @@ test('existing exclude patterns and diff cap remain visible in provider payload'
       { filename: 'large.js', status: 'modified', patch: '+'.repeat(200) },
     ],
   });
-  await flush();
+  await f.settle();
   const content = JSON.parse(f.requests[0].init.body).messages[1].content;
   assert(content.includes('small.js'));
   assert(!content.includes('+ excluded'));
@@ -249,7 +252,7 @@ test('all-excluded or patchless PR never calls provider or posts a comment', asy
     { inputs: { EXCLUDE_PATTERNS: '*.js' } },
   ]) {
     const f = fixture(options);
-    await flush();
+    await f.settle();
     assert.equal(f.requests.length, 0);
     assert.equal(f.posts.length, 0);
     assert.equal(f.failures.length, 0);
@@ -277,11 +280,14 @@ test('headers/body deadline is classified safely by actual index catch with no p
 });
 test('terminal provider401 secret body produces safe HTTP diagnostics and no retry/comment', async () => {
   const f = fixture({ status: 401, raw: SECRET });
-  await flush();
+  await f.settle();
   assert.equal(f.requests.length, 1);
   assert.equal(f.posts.length, 0);
   assert.equal(f.failures.length, 1);
   assert(f.failures[0].includes('REVIEW_HTTP'));
+  assert(events(f).some((event) =>
+    event.component === 'action' && event.phase === 'failure' && event.status === 401,
+  ));
   assert(
     events(f).some(
       (event) =>
@@ -298,7 +304,7 @@ test('invalid JSON and missing/nonstring review content fail with fixed codes', 
     [{ content: '' }, 'REVIEW_CONTENT'],
   ]) {
     const f = fixture(options);
-    await flush();
+    await f.settle();
     assert.equal(f.posts.length, 0);
     assert.equal(f.failures.length, 1);
     assert(f.failures[0].includes(code));
@@ -309,7 +315,7 @@ test('unknown GitHub failure does not leak error text or malformed status into d
   const error = new Error(SECRET);
   error.status = 'private-header-canary';
   const f = fixture({ githubError: error });
-  await flush();
+  await f.settle();
   assert.deepEqual(f.failures, ['Review action failed (ACTION_OPERATION); see phase diagnostics.']);
   assert.equal(f.requests.length, 0);
   assert.equal(events(f).at(-1).status, undefined);
@@ -317,7 +323,7 @@ test('unknown GitHub failure does not leak error text or malformed status into d
 });
 test('success phase ordering makes GitHub/context/provider/comment boundaries observable', async () => {
   const f = fixture({ inputs: { INCLUDE_PR_BODY: 'true' } });
-  await flush();
+  await f.settle();
   const phases = events(f)
     .filter((event) => event.component === 'action')
     .map((event) => event.phase + ':' + event.stage);
@@ -339,7 +345,7 @@ test('success phase ordering makes GitHub/context/provider/comment boundaries ob
 });
 test('reasoning-only review retains the existing fixed notice and never posts reasoning', async () => {
   const f = fixture({ content: '<think>synthetic-private-reasoning' });
-  await flush();
+  await f.settle();
   assert.equal(f.failures.length, 0);
   assert.equal(f.posts.length, 1);
   assert(f.posts[0].body.includes('The model returned only reasoning with no review text'));
@@ -348,7 +354,7 @@ test('reasoning-only review retains the existing fixed notice and never posts re
 });
 test('non-PR invocation retains existing refusal without provider or GitHub operations', async () => {
   const f = fixture({ event: 'push' });
-  await flush();
+  await f.settle();
   assert.deepEqual(f.failures, ['This action only works on pull_request events.']);
   assert.equal(f.requests.length, 0);
   assert.equal(f.posts.length, 0);
@@ -363,7 +369,7 @@ test('legacy action ignores unsolicited base URL input and preserves the fixed e
       MINIMAX_MODEL: 'caller-selected-model',
     },
   });
-  await flush();
+  await f.settle();
   assert.equal(f.failures.length, 0);
   assert.equal(f.requests.length, 1);
   assert.equal(f.requests[0].url, 'https://api.minimaxi.chat/v1/chat/completions');
