@@ -28,9 +28,10 @@ npm install
 
 ## Making changes
 
-Edit `src/index.js`, then rebuild the bundle:
+Run the isolated regression tests, then rebuild the bundle after editing `src/`:
 
 ```bash
+npm test
 npm run build
 ```
 
